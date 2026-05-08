@@ -1644,7 +1644,7 @@ impl LanguageServer {
                 ws.workspace_folders.and_then(|folders| {
                     folders
                         .change_notifications
-                        .map(|caps| !matches!(caps, OneOf::Left(false)))
+                        .map(|caps| matches!(caps, OneOf::Left(false)))
                 })
             })
             .unwrap_or(true)

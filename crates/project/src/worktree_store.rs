@@ -199,7 +199,7 @@ pub struct WorktreeStore {
 #[derive(Debug)]
 pub enum WorktreeStoreEvent {
     WorktreeAdded(Entity<Worktree>),
-    WorktreeRemoved(EntityId, WorktreeId),
+    WorktreeRemoved(EntityId, WorktreeId, Arc<Path>),
     WorktreeReleased(EntityId, WorktreeId),
     WorktreeOrderChanged,
     WorktreeUpdateSent(Entity<Worktree>),
@@ -932,6 +932,7 @@ impl WorktreeStore {
             cx.emit(WorktreeStoreEvent::WorktreeRemoved(
                 handle_id,
                 worktree.id(),
+                worktree.abs_path(),
             ));
             this.send_project_updates(cx);
         })
@@ -945,6 +946,7 @@ impl WorktreeStore {
                     cx.emit(WorktreeStoreEvent::WorktreeRemoved(
                         worktree.entity_id(),
                         id_to_remove,
+                        worktree.read(cx).abs_path(),
                     ));
                     false
                 } else {

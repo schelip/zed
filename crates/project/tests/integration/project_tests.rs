@@ -1455,11 +1455,8 @@ async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
     });
     cx.executor().run_until_parked();
     assert_eq!(servers.len(), 1);
-    let (adapter, server) = servers.into_iter().next().unwrap();
+    let (adapter, _server) = servers.into_iter().next().unwrap();
     assert_eq!(adapter.name(), LanguageServerName::new_static("ty"));
-    // We're not using venvs at all here, so both folders should fall under the same root.
-    assert_eq!(server.server_id(), LanguageServerId(0));
-    // Now, let's select a different toolchain for one of subprojects.
 
     let Toolchains {
         toolchains: available_toolchains_for_b,
@@ -1529,7 +1526,7 @@ async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
     let (adapter, server) = servers.into_iter().next().unwrap();
     assert_eq!(adapter.name(), LanguageServerName::new_static("ty"));
     // There's a new language server in town.
-    assert_eq!(server.server_id(), LanguageServerId(1));
+    assert_eq!(server.server_id(), LanguageServerId(2));
 }
 
 #[gpui::test]

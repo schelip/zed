@@ -10,7 +10,10 @@ use language::{
 use parking_lot::RwLock;
 use project::{LspStore, lsp_store::LocalLspAdapterDelegate};
 use settings::{LSP_SETTINGS_SCHEMA_URL_PREFIX, Settings as _, SettingsLocation};
-use util::schemars::{AllowTrailingCommas, DefaultDenyUnknownFields};
+use util::{
+    rel_path::RelPath,
+    schemars::{AllowTrailingCommas, DefaultDenyUnknownFields},
+};
 
 const SCHEMA_URI_PREFIX: &str = "zed://schemas/";
 
@@ -285,7 +288,10 @@ async fn resolve_dynamic_schema(
                             return None;
                         };
                         Some(LocalLspAdapterDelegate::from_local_lsp(
-                            local, &worktree, cx,
+                            local,
+                            &worktree,
+                            RelPath::empty().into(),
+                            cx,
                         ))
                     })
                 })

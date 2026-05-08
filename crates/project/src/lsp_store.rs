@@ -260,6 +260,7 @@ struct LanguageServerSeedSettings {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct LanguageServerSeed {
     worktree_id: WorktreeId,
+    root_path: Arc<RelPath>,
     name: LanguageServerName,
     toolchain: Option<Toolchain>,
     settings: LanguageServerSeedSettings,
@@ -362,6 +363,7 @@ impl LocalLspStore {
     ) -> LanguageServerId {
         let key = LanguageServerSeed {
             worktree_id: worktree_handle.read(cx).id(),
+            root_path: disposition.path.path.clone(),
             name: disposition.server_name.clone(),
             settings: LanguageServerSeedSettings {
                 binary: disposition.settings.binary.clone(),
@@ -480,6 +482,7 @@ impl LocalLspStore {
         let pending_server = cx.spawn({
             let adapter = adapter.clone();
             let server_name = adapter.name.clone();
+            let worktree_abs_path = worktree_handle.read(cx).absolutize(&key.root_path);
             let stderr_capture = stderr_capture.clone();
             #[cfg(any(test, feature = "test-support"))]
             let lsp_store = self.weak.clone();
@@ -2764,6 +2767,7 @@ impl LocalLspStore {
             return;
         };
         origin_seed.worktree_id = worktree_id;
+        origin_seed.root_path = RelPath::empty().into();
         self.language_server_ids
             .entry(origin_seed)
             .or_insert_with(|| UnifiedLanguageServer {
@@ -2811,11 +2815,16 @@ impl LocalLspStore {
             return;
         };
         let language_name = language.name();
-        let (reused, delegate, servers) = self
+        let (reused, _delegate, servers) = self
             .reuse_existing_language_server(&self.lsp_tree, &worktree, &language_name, cx)
             .map(|(delegate, apply)| (true, delegate, apply(&mut self.lsp_tree)))
             .unwrap_or_else(|| {
-                let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(self, &worktree, cx);
+                let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(
+                    self,
+                    &worktree,
+                    RelPath::empty().into(),
+                    cx,
+                );
                 let delegate: Arc<dyn ManifestDelegate> =
                     Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
 
@@ -2852,13 +2861,19 @@ impl LocalLspStore {
 
                 let server_id = server_node.server_id_or_init(|disposition| {
                     let path = &disposition.path;
+                    let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(
+                        self,
+                        &worktree,
+                        path.path.clone(),
+                        cx,
+                    );
 
                     {
                         let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
 
                         let server_id = self.get_or_insert_language_server(
                             &worktree,
-                            delegate.clone(),
+                            lsp_delegate,
                             disposition,
                             &language_name,
                             cx,
@@ -2999,7 +3014,8 @@ impl LocalLspStore {
             servers
         };
 
-        let delegate = LocalLspAdapterDelegate::from_local_lsp(self, worktree, cx);
+        let delegate =
+            LocalLspAdapterDelegate::from_local_lsp(self, worktree, RelPath::empty().into(), cx);
         Some((delegate, apply))
     }
 
@@ -3570,6 +3586,30 @@ impl LocalLspStore {
             failed_change: None,
             failure_reason: None,
         })
+    }
+
+    fn remove_worktree_workspace_folder(&mut self, abs_path: &Path) {
+        let Ok(uri) = Uri::from_file_path(abs_path) else {
+            return;
+        };
+
+        for state in self.language_servers.values() {
+            state.remove_workspace_folder(uri.clone());
+        }
+    }
+
+    fn add_worktree_workspace_folder(&mut self, worktree: &Entity<Worktree>, cx: &mut App) {
+        let worktree = worktree.read(cx);
+        if !worktree.is_visible() {
+            return;
+        }
+        let Ok(uri) = Uri::from_file_path(worktree.abs_path()) else {
+            return;
+        };
+
+        for state in self.language_servers.values() {
+            state.add_workspace_folder(uri.clone());
+        }
     }
 
     fn remove_worktree(
@@ -4445,9 +4485,15 @@ impl LspStore {
                     | worktree::Event::Deleted
                     | worktree::Event::UpdatedRootRepoCommonDir { .. } => {}
                 })
-                .detach()
+                .detach();
+
+                if let Some(local) = self.as_local_mut() {
+                    local.add_worktree_workspace_folder(worktree, cx);
+                }
             }
-            WorktreeStoreEvent::WorktreeRemoved(_, id) => self.remove_worktree(*id, cx),
+            WorktreeStoreEvent::WorktreeRemoved(_, id, abs_path) => {
+                self.remove_worktree(*id, abs_path, cx);
+            }
             WorktreeStoreEvent::WorktreeUpdateSent(worktree) => {
                 worktree.update(cx, |worktree, _cx| self.send_diagnostic_summaries(worktree));
             }
@@ -5395,6 +5441,7 @@ impl LspStore {
                     &environment,
                     weak.clone(),
                     &worktree,
+                    RelPath::empty().into(),
                     http_client.clone(),
                     fs.clone(),
                     cx,
@@ -5467,6 +5514,7 @@ impl LspStore {
                             let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
                             let key = LanguageServerSeed {
                                 worktree_id,
+                                root_path: path.path.clone(),
                                 name: disposition.server_name.clone(),
                                 settings: LanguageServerSeedSettings {
                                     binary: disposition.settings.binary.clone(),
@@ -8250,6 +8298,7 @@ impl LspStore {
                                         &local.environment,
                                         cx.weak_entity(),
                                         &worktree,
+                                        seed.root_path.clone(),
                                         local.http_client.clone(),
                                         local.fs.clone(),
                                         cx,
@@ -8386,9 +8435,15 @@ impl LspStore {
             .find(|(_, s)| s.server_id() == server_id)
     }
 
-    fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
+    fn remove_worktree(
+        &mut self,
+        id_to_remove: WorktreeId,
+        abs_path: &Path,
+        cx: &mut Context<Self>,
+    ) {
         self.diagnostic_summaries.remove(&id_to_remove);
         if let Some(local) = self.as_local_mut() {
+            local.remove_worktree_workspace_folder(abs_path);
             let to_remove = local.remove_worktree(id_to_remove, cx);
             for server in to_remove {
                 self.language_server_statuses.remove(&server);
@@ -14130,7 +14185,7 @@ impl LanguageServerState {
             }
         }
     }
-    fn _remove_workspace_folder(&self, uri: Uri) {
+    fn remove_workspace_folder(&self, uri: Uri) {
         match self {
             LanguageServerState::Starting {
                 pending_workspace_folders,
@@ -14397,6 +14452,8 @@ pub fn language_server_settings_for<'a>(
 pub struct LocalLspAdapterDelegate {
     lsp_store: WeakEntity<LspStore>,
     worktree: worktree::Snapshot,
+    root_path: Arc<RelPath>,
+    root_abs_path: Arc<Path>,
     fs: Arc<dyn Fs>,
     http_client: Arc<dyn HttpClient>,
     language_registry: Arc<LanguageRegistry>,
@@ -14409,16 +14466,21 @@ impl LocalLspAdapterDelegate {
         environment: &Entity<ProjectEnvironment>,
         lsp_store: WeakEntity<LspStore>,
         worktree: &Entity<Worktree>,
+        root_path: Arc<RelPath>,
         http_client: Arc<dyn HttpClient>,
         fs: Arc<dyn Fs>,
         cx: &mut App,
     ) -> Arc<Self> {
         let load_shell_env_task =
             environment.update(cx, |env, cx| env.worktree_environment(worktree.clone(), cx));
+        let worktree = worktree.read(cx).snapshot();
+        let root_abs_path: Arc<Path> = worktree.absolutize(&root_path).into();
 
         Arc::new(Self {
             lsp_store,
-            worktree: worktree.read(cx).snapshot(),
+            worktree,
+            root_path,
+            root_abs_path,
             fs,
             http_client,
             language_registry,
@@ -14429,6 +14491,7 @@ impl LocalLspAdapterDelegate {
     pub fn from_local_lsp(
         local: &LocalLspStore,
         worktree: &Entity<Worktree>,
+        root_path: Arc<RelPath>,
         cx: &mut App,
     ) -> Arc<Self> {
         Self::new(
@@ -14436,6 +14499,7 @@ impl LocalLspAdapterDelegate {
             &local.environment,
             local.weak.clone(),
             worktree,
+            root_path,
             local.http_client.clone(),
             local.fs.clone(),
             cx,
@@ -14462,11 +14526,29 @@ impl LspAdapterDelegate for LocalLspAdapterDelegate {
     }
 
     fn worktree_root_path(&self) -> &Path {
-        self.worktree.abs_path().as_ref()
+        self.root_abs_path.as_ref()
     }
 
     fn resolve_relative_path(&self, path: PathBuf) -> PathBuf {
-        self.worktree.resolve_relative_path(path)
+        if let Some(path_str) = path.to_str() {
+            if let Some(remaining_path) = path_str.strip_prefix("~/") {
+                return util::paths::home_dir().join(remaining_path);
+            } else if path_str == "~" {
+                return util::paths::home_dir().to_path_buf();
+            }
+        }
+
+        if path.is_relative()
+            && let Ok(relative_path) = RelPath::new(&path, self.worktree.path_style())
+            && self
+                .worktree
+                .entry_for_path(&self.root_path.join(&relative_path))
+                .is_some()
+        {
+            self.root_abs_path.join(path)
+        } else {
+            self.worktree.resolve_relative_path(path)
+        }
     }
 
     async fn shell_env(&self) -> HashMap<String, String> {
